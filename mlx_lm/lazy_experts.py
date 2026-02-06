@@ -8,6 +8,84 @@ import mlx.nn as nn
 from .models.switch_layers import QuantizedSwitchLinear
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: LCP cache (eval-based, per-token cache lookup)
+# ---------------------------------------------------------------------------
+
+class ExpertCache:
+    """Per-layer LCP (Least Critical Priority) cache for expert weights.
+
+    Shared by all 3 projections (gate/up/down) within one MoE layer.
+    Eviction priority: P = μ × 0.25^(ν / 128) where μ = activation count,
+    ν = steps since last activation. Lower P → evicted first.
+
+    Step tracking: SwitchGLU calls up_proj → gate_proj → down_proj sequentially,
+    so _proj_count cycles 0→1→2→0. Step increments on the first call (count == 0
+    after reset), and frequency/recency are updated once per step.
+    """
+    __slots__ = ('entries', 'frequency', 'last_active', 'step',
+                 '_proj_count', 'capacity', 'hits', 'misses')
+
+    def __init__(self, capacity: int):
+        self.entries: dict[int, dict[str, tuple]] = {}
+        self.frequency: dict[int, int] = {}
+        self.last_active: dict[int, int] = {}
+        self.step = 0
+        self._proj_count = 0
+        self.capacity = capacity
+        self.hits = 0
+        self.misses = 0
+
+    def projection_called(self, expert_ids: np.ndarray):
+        """Called once per projection. Increments step every 3rd call."""
+        if self._proj_count == 0:
+            self.step += 1
+            for eid in expert_ids:
+                eid = int(eid)
+                self.frequency[eid] = self.frequency.get(eid, 0) + 1
+                self.last_active[eid] = self.step
+        self._proj_count = (self._proj_count + 1) % 3
+
+    def lookup(self, expert_id: int, proj_name: str):
+        """Return cached (w, s, b) or None. No stats tracking."""
+        entry = self.entries.get(expert_id)
+        if entry is not None:
+            return entry.get(proj_name)
+        return None
+
+    def put(self, expert_id: int, proj_name: str, w, s, b):
+        if expert_id not in self.entries:
+            self.entries[expert_id] = {}
+        self.entries[expert_id][proj_name] = (w, s, b)
+
+    def evict_if_needed(self, protected: set[int]):
+        """Evict lowest-priority experts until at or under capacity."""
+        while len(self.entries) > self.capacity:
+            worst_id = None
+            worst_p = float('inf')
+            for eid in self.entries:
+                if eid in protected:
+                    continue
+                p = self._priority(eid)
+                if p < worst_p:
+                    worst_p = p
+                    worst_id = eid
+            if worst_id is None:
+                break
+            del self.entries[worst_id]
+            del self.frequency[worst_id]
+            del self.last_active[worst_id]
+
+    def _priority(self, expert_id: int) -> float:
+        mu = self.frequency.get(expert_id, 0)
+        nu = self.step - self.last_active.get(expert_id, 0)
+        return mu * (0.25 ** (nu / 128))
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Lazy loading (no cache, fresh mx.load per call)
+# ---------------------------------------------------------------------------
+
 class LazyQuantizedSwitchLinear(nn.Module):
     """Drop-in replacement for QuantizedSwitchLinear that loads experts on demand.
 
@@ -61,6 +139,214 @@ class LazyQuantizedSwitchLinear(nn.Module):
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Cached loading (eval-based, LCP eviction)
+# ---------------------------------------------------------------------------
+
+class CachedQuantizedSwitchLinear(nn.Module):
+    """Expert loader with per-layer LCP caching. Drop-in for QuantizedSwitchLinear.
+
+    Cache hits serve weights from Metal memory. Misses batch-load from the
+    safetensors shard, eval once, then insert individually into the cache.
+    """
+
+    def __init__(self, shard_path: str, key_prefix: str, group_size: int,
+                 bits: int, mode: str, proj_name: str,
+                 cache: ExpertCache):
+        super().__init__()
+        self._shard_path = shard_path
+        self._key_prefix = key_prefix
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self._proj_name = proj_name
+        self._cache = cache
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        mx.eval(indices)
+        indices_np = np.asarray(indices.reshape(-1))
+        unique_ids = np.unique(indices_np)
+
+        self._cache.projection_called(unique_ids)
+
+        # Partition into hits and misses
+        hit_ids = []
+        miss_ids = []
+        for eid in unique_ids:
+            eid = int(eid)
+            if self._cache.lookup(eid, self._proj_name) is not None:
+                hit_ids.append(eid)
+                self._cache.hits += 1
+            else:
+                miss_ids.append(eid)
+                self._cache.misses += 1
+
+        # Batch-load misses from shard
+        if miss_ids:
+            miss_arr = mx.array(miss_ids)
+            shard = mx.load(self._shard_path)
+            w_batch = shard[f"{self._key_prefix}.weight"][miss_arr]
+            s_batch = shard[f"{self._key_prefix}.scales"][miss_arr]
+            biases_key = f"{self._key_prefix}.biases"
+            b_batch = shard[biases_key][miss_arr] if biases_key in shard else None
+            mx.eval(w_batch, s_batch) if b_batch is None else mx.eval(w_batch, s_batch, b_batch)
+
+            for i, eid in enumerate(miss_ids):
+                self._cache.put(
+                    eid, self._proj_name,
+                    w_batch[i], s_batch[i],
+                    b_batch[i] if b_batch is not None else None,
+                )
+
+        protected = set(int(e) for e in unique_ids)
+        self._cache.evict_if_needed(protected)
+
+        # Assemble full tensors from cache in expert order
+        all_ids = sorted(int(e) for e in unique_ids)
+        ws, ss, bs = [], [], []
+        has_bias = None
+        for eid in all_ids:
+            w, s, b = self._cache.lookup(eid, self._proj_name)
+            ws.append(w)
+            ss.append(s)
+            if has_bias is None:
+                has_bias = b is not None
+            if has_bias:
+                bs.append(b)
+
+        w_cat = mx.stack(ws)
+        s_cat = mx.stack(ss)
+        b_cat = mx.stack(bs) if has_bias else None
+
+        # Remap global expert indices to 0..N-1 local indices
+        unique_sorted = np.array(all_ids, dtype=np.int32)
+        remap = np.empty(unique_sorted[-1] + 1, dtype=np.int32)
+        remap[unique_sorted] = np.arange(len(unique_sorted), dtype=np.int32)
+        remapped = mx.array(remap[indices_np].reshape(indices.shape))
+
+        return mx.gather_qmm(
+            x,
+            w_cat,
+            s_cat,
+            b_cat,
+            rhs_indices=remapped,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=sorted_indices,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Predictive cache (zero-eval forward pass)
+# ---------------------------------------------------------------------------
+
+class PredictiveExpertCache:
+    """Per-layer cache with GPU-resident weight tensors and lookup table.
+
+    Pre-loads a subset of experts into Metal memory at startup. During the
+    forward pass, a lookup table remaps global expert IDs (0-511) to cache
+    slots (0 to C-1) entirely on GPU — no mx.eval needed. Uncached experts
+    map to slot 0 (fallback).
+    """
+    __slots__ = ('capacity', 'num_experts', 'lookup',
+                 'weights', 'scales', 'biases')
+
+    def __init__(self, capacity: int, num_experts: int = 512):
+        self.capacity = capacity
+        self.num_experts = num_experts
+        self.weights: dict[str, mx.array] = {}
+        self.scales: dict[str, mx.array] = {}
+        self.biases: dict[str, mx.array | None] = {}
+        self.lookup: mx.array | None = None
+
+    def build_lookup(self, cached_ids: list[int]):
+        """Build GPU-resident lookup table. Uncached IDs map to slot 0."""
+        lookup_np = np.zeros(self.num_experts, dtype=np.int32)
+        for slot, eid in enumerate(cached_ids):
+            lookup_np[eid] = slot
+        self.lookup = mx.array(lookup_np)
+
+    def remap(self, indices: mx.array) -> mx.array:
+        """Map global expert IDs to cache slots. Pure mx.array op, no eval."""
+        return self.lookup[indices]
+
+
+class PredictiveCachedSwitchLinear(nn.Module):
+    """Zero-eval expert dispatch using pre-loaded weights and GPU lookup table.
+
+    The forward pass stays entirely lazy — indices are remapped via a
+    pre-built lookup table on GPU, and gather_qmm uses pre-loaded weight
+    tensors already in Metal memory. No mx.eval until the output token.
+    """
+
+    def __init__(self, group_size: int, bits: int, mode: str,
+                 proj_name: str, cache: PredictiveExpertCache):
+        super().__init__()
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self._proj_name = proj_name
+        self._cache = cache
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        local_indices = self._cache.remap(indices)
+        return mx.gather_qmm(
+            x,
+            self._cache.weights[self._proj_name],
+            self._cache.scales[self._proj_name],
+            self._cache.biases[self._proj_name],
+            rhs_indices=local_indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=sorted_indices,
+        )
+
+
+class SyncPredictiveCachedSwitchLinear(nn.Module):
+    """Same as PredictiveCachedSwitchLinear but WITH mx.eval(indices).
+
+    Isolates the sync-point hypothesis: pre-stacked tensors, GPU lookup table,
+    but forces a per-layer pipeline flush via mx.eval. Comparing this against
+    PredictiveCachedSwitchLinear measures the cost of sync points alone.
+    """
+
+    def __init__(self, group_size: int, bits: int, mode: str,
+                 proj_name: str, cache: PredictiveExpertCache):
+        super().__init__()
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self._proj_name = proj_name
+        self._cache = cache
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        mx.eval(indices)
+        local_indices = self._cache.remap(indices)
+        return mx.gather_qmm(
+            x,
+            self._cache.weights[self._proj_name],
+            self._cache.scales[self._proj_name],
+            self._cache.biases[self._proj_name],
+            rhs_indices=local_indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=sorted_indices,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Setup functions
+# ---------------------------------------------------------------------------
+
 def _build_shard_map(model_path: Path) -> dict[str, str]:
     """Read model.safetensors.index.json and return {key: absolute_shard_path}."""
     index_path = model_path / "model.safetensors.index.json"
@@ -69,12 +355,17 @@ def _build_shard_map(model_path: Path) -> dict[str, str]:
     return {key: str(model_path / shard) for key, shard in weight_map.items()}
 
 
-def enable_lazy_experts(model, model_path: Path) -> int:
-    """Replace QuantizedSwitchLinear modules in MoE layers with lazy versions.
+def enable_lazy_experts(model, model_path: Path, cache_capacity_per_layer: int = 0,
+                        predictive: bool = False) -> int:
+    """Replace QuantizedSwitchLinear modules in MoE layers with lazy/cached versions.
 
     Args:
         model: The loaded MLX model (with lazy=True).
         model_path: Path to the model directory containing safetensors shards.
+        cache_capacity_per_layer: Number of experts to cache per layer. 0 = no cache
+            (Phase 1 lazy loading). > 0 = LCP-cached or predictive loading.
+        predictive: If True and cache_capacity > 0, use zero-eval predictive cache
+            (Phase 3). Pre-loads experts at startup, eliminates per-layer mx.eval.
 
     Returns:
         Number of modules replaced (expected: 48 layers x 3 = 144).
@@ -82,6 +373,15 @@ def enable_lazy_experts(model, model_path: Path) -> int:
     model_path = Path(model_path)
     shard_map = _build_shard_map(model_path)
 
+    if predictive and cache_capacity_per_layer > 0:
+        return _enable_predictive(model, shard_map, cache_capacity_per_layer)
+    elif cache_capacity_per_layer > 0:
+        return _enable_cached(model, shard_map, cache_capacity_per_layer)
+    else:
+        return _enable_lazy(model, shard_map)
+
+
+def _enable_lazy(model, shard_map: dict, ) -> int:
     replaced = 0
     for i, layer in enumerate(model.layers):
         if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
@@ -93,13 +393,218 @@ def enable_lazy_experts(model, model_path: Path) -> int:
                 continue
             key_prefix = f"model.layers.{i}.mlp.switch_mlp.{name}"
             shard_path = shard_map[f"{key_prefix}.weight"]
-            lazy = LazyQuantizedSwitchLinear(
+            replacement = LazyQuantizedSwitchLinear(
                 shard_path=shard_path,
                 key_prefix=key_prefix,
                 group_size=orig.group_size,
                 bits=orig.bits,
                 mode=orig.mode,
             )
-            setattr(switch, name, lazy)
+            setattr(switch, name, replacement)
             replaced += 1
     return replaced
+
+
+def _enable_cached(model, shard_map: dict, capacity: int) -> int:
+    replaced = 0
+    for i, layer in enumerate(model.layers):
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        switch = layer.mlp.switch_mlp
+        layer_cache = ExpertCache(capacity)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            orig = getattr(switch, name)
+            if not isinstance(orig, QuantizedSwitchLinear):
+                continue
+            key_prefix = f"model.layers.{i}.mlp.switch_mlp.{name}"
+            shard_path = shard_map[f"{key_prefix}.weight"]
+            replacement = CachedQuantizedSwitchLinear(
+                shard_path=shard_path,
+                key_prefix=key_prefix,
+                group_size=orig.group_size,
+                bits=orig.bits,
+                mode=orig.mode,
+                proj_name=name,
+                cache=layer_cache,
+            )
+            setattr(switch, name, replacement)
+            replaced += 1
+    return replaced
+
+
+def _enable_predictive(model, shard_map: dict, capacity: int) -> int:
+    """Install Phase 2 modules for warmup. Call upgrade_to_predictive() after."""
+    return _enable_cached(model, shard_map, capacity)
+
+
+def upgrade_to_predictive(model, model_path: Path, capacity: int,
+                          sync: bool = False) -> int:
+    """Harvest Phase 2 LCP caches into zero-eval predictive tensors.
+
+    Call this after running warmup generation with Phase 2 (CachedQuantizedSwitchLinear).
+    Harvests discovered experts from LCP caches, fills remaining capacity from disk,
+    then swaps to PredictiveCachedSwitchLinear for zero-eval forward pass.
+
+    Args:
+        sync: If True, use SyncPredictiveCachedSwitchLinear (adds mx.eval per layer,
+              for benchmarking the sync-point hypothesis).
+
+    Returns number of modules upgraded.
+    """
+    model_path = Path(model_path)
+    shard_map = _build_shard_map(model_path)
+
+    upgraded = 0
+    for i, layer in enumerate(model.layers):
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        switch = layer.mlp.switch_mlp
+
+        # Get the Phase 2 module and its LCP cache
+        first_proj = getattr(switch, "gate_proj")
+        if not isinstance(first_proj, CachedQuantizedSwitchLinear):
+            continue
+        lcp_cache = first_proj._cache
+        num_experts = 512  # Qwen3-Coder-Next
+        C = min(capacity, num_experts)
+
+        # Harvest expert IDs discovered by LCP, sorted by priority (best first)
+        discovered = sorted(
+            lcp_cache.entries.keys(),
+            key=lambda eid: lcp_cache._priority(eid),
+            reverse=True,
+        )[:C]
+        discovered_set = set(discovered)
+
+        # Fill remaining capacity with sequential IDs not already discovered
+        filler = []
+        for eid in range(num_experts):
+            if len(discovered) + len(filler) >= C:
+                break
+            if eid not in discovered_set:
+                filler.append(eid)
+        cached_ids = list(discovered) + filler
+
+        pred_cache = PredictiveExpertCache(C, num_experts)
+
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            phase2_mod = getattr(switch, name)
+            key_prefix = f"model.layers.{i}.mlp.switch_mlp.{name}"
+            shard_path = shard_map[f"{key_prefix}.weight"]
+
+            # Collect tensors: harvested from LCP cache + loaded from disk
+            ws, ss, bs = [], [], []
+            to_load = []  # (slot_index, expert_id) for disk loads
+            has_bias = None
+
+            for slot, eid in enumerate(cached_ids):
+                cached = lcp_cache.lookup(eid, name)
+                if cached is not None:
+                    w, s, b = cached
+                    ws.append(w)
+                    ss.append(s)
+                    if has_bias is None:
+                        has_bias = b is not None
+                    if has_bias:
+                        bs.append(b)
+                else:
+                    to_load.append((slot, eid))
+                    ws.append(None)
+                    ss.append(None)
+                    if has_bias is None:
+                        has_bias = False  # determined by first non-None entry
+                    if has_bias:
+                        bs.append(None)
+
+            # Batch-load missing experts from disk
+            if to_load:
+                load_ids = mx.array([eid for _, eid in to_load])
+                shard = mx.load(shard_path)
+                w_batch = shard[f"{key_prefix}.weight"][load_ids]
+                s_batch = shard[f"{key_prefix}.scales"][load_ids]
+                biases_key = f"{key_prefix}.biases"
+                b_batch = shard[biases_key][load_ids] if biases_key in shard else None
+                if b_batch is None:
+                    mx.eval(w_batch, s_batch)
+                else:
+                    mx.eval(w_batch, s_batch, b_batch)
+                    if has_bias is None:
+                        has_bias = True
+
+                for j, (slot, _) in enumerate(to_load):
+                    ws[slot] = w_batch[j]
+                    ss[slot] = s_batch[j]
+                    if has_bias and b_batch is not None:
+                        bs[slot] = b_batch[j]
+
+            pred_cache.weights[name] = mx.stack(ws)
+            pred_cache.scales[name] = mx.stack(ss)
+            pred_cache.biases[name] = mx.stack(bs) if has_bias else None
+
+        # Build lookup and install modules
+        pred_cache.build_lookup(cached_ids)
+        mx.eval(pred_cache.lookup)
+
+        cls = SyncPredictiveCachedSwitchLinear if sync else PredictiveCachedSwitchLinear
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            phase2_mod = getattr(switch, name)
+            replacement = cls(
+                group_size=phase2_mod.group_size,
+                bits=phase2_mod.bits,
+                mode=phase2_mod.mode,
+                proj_name=name,
+                cache=pred_cache,
+            )
+            setattr(switch, name, replacement)
+            upgraded += 1
+
+        # Clear LCP cache to free duplicated tensors
+        lcp_cache.entries.clear()
+        lcp_cache.frequency.clear()
+        lcp_cache.last_active.clear()
+
+        print(f"  Layer {i}: {len(discovered)} discovered + {len(filler)} filler "
+              f"= {C} experts ({mx.get_active_memory() / 1e9:.1f} GB)")
+
+    return upgraded
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+def get_cache_stats(model) -> dict:
+    """Collect hit/miss stats from all ExpertCache instances in the model."""
+    total_hits = 0
+    total_misses = 0
+    layer_stats = []
+
+    for i, layer in enumerate(model.layers):
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        switch = layer.mlp.switch_mlp
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, CachedQuantizedSwitchLinear):
+            continue
+        cache = proj._cache
+        hits = cache.hits
+        misses = cache.misses
+        total = hits + misses
+        rate = hits / total if total > 0 else 0.0
+        layer_stats.append({
+            "layer": i,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": rate,
+            "cached_experts": len(cache.entries),
+        })
+        total_hits += hits
+        total_misses += misses
+
+    total = total_hits + total_misses
+    return {
+        "total_hits": total_hits,
+        "total_misses": total_misses,
+        "total_hit_rate": total_hits / total if total > 0 else 0.0,
+        "layers": layer_stats,
+    }
