@@ -361,8 +361,9 @@ class PredictiveExpertCache:
         MAX_SWAPS = 10
         swaps = swaps[:MAX_SWAPS]
 
-        # Load new experts and rebuild tensors
+        # Load new experts and scatter into stacked tensors
         new_eids = mx.array([new_eid for _, _, new_eid in swaps])
+        slot_indices = mx.array([slot for slot, _, _ in swaps])
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             shard_path = self._shard_paths[proj_name]
             key_prefix = self._key_prefixes[proj_name]
@@ -378,25 +379,18 @@ class PredictiveExpertCache:
             else:
                 mx.eval(new_w, new_s, new_b)
 
-            w_list = [self.weights[proj_name][i] for i in range(self.capacity)]
-            s_list = [self.scales[proj_name][i] for i in range(self.capacity)]
-            has_bias = self.biases[proj_name] is not None
-            b_list = (
-                [self.biases[proj_name][i] for i in range(self.capacity)]
-                if has_bias else None
-            )
+            w = self.weights.pop(proj_name)
+            w[slot_indices] = new_w
+            self.weights[proj_name] = w
 
-            for j, (slot, _, _) in enumerate(swaps):
-                w_list[slot] = new_w[j]
-                s_list[slot] = new_s[j]
-                if has_bias and new_b is not None:
-                    b_list[slot] = new_b[j]
-            del new_w, new_s, new_b
+            s = self.scales.pop(proj_name)
+            s[slot_indices] = new_s
+            self.scales[proj_name] = s
 
-            self.weights[proj_name] = mx.stack(w_list)
-            self.scales[proj_name] = mx.stack(s_list)
-            if has_bias:
-                self.biases[proj_name] = mx.stack(b_list)
+            if self.biases[proj_name] is not None and new_b is not None:
+                b = self.biases.pop(proj_name)
+                b[slot_indices] = new_b
+                self.biases[proj_name] = b
 
         mx.clear_cache()
 
@@ -628,7 +622,7 @@ def reset_to_cached(model, model_path: Path, capacity: int) -> int:
     return reset
 
 
-def upgrade_to_predictive(model, model_path: Path, capacity: int,
+def upgrade_to_predictive(model, model_path: Path, capacity,
                           sync: bool = False) -> int:
     """Harvest Phase 2 LCP caches into zero-eval predictive tensors.
 
@@ -637,6 +631,7 @@ def upgrade_to_predictive(model, model_path: Path, capacity: int,
     then swaps to PredictiveCachedSwitchLinear for zero-eval forward pass.
 
     Args:
+        capacity: int for uniform capacity, or list[int] for per-MoE-layer capacities.
         sync: If True, use SyncPredictiveCachedSwitchLinear (adds mx.eval per layer,
               for benchmarking the sync-point hypothesis).
 
@@ -644,8 +639,10 @@ def upgrade_to_predictive(model, model_path: Path, capacity: int,
     """
     model_path = Path(model_path)
     shard_map = _build_shard_map(model_path)
+    per_layer_caps = isinstance(capacity, (list, tuple))
 
     upgraded = 0
+    moe_idx = 0
     for i, layer in enumerate(model.layers):
         if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
             continue
@@ -657,7 +654,8 @@ def upgrade_to_predictive(model, model_path: Path, capacity: int,
             continue
         lcp_cache = first_proj._cache
         num_experts = 512  # Qwen3-Coder-Next
-        C = min(capacity, num_experts)
+        C = min(capacity[moe_idx] if per_layer_caps else capacity, num_experts)
+        moe_idx += 1
 
         # Harvest expert IDs discovered by LCP, sorted by priority (best first)
         discovered = sorted(
@@ -859,8 +857,319 @@ def get_fallback_stats(model) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Delta warmup (fast multi-turn cache update)
+# ---------------------------------------------------------------------------
+
+def delta_warmup(model, tokenizer, model_path, new_prompt, discovery_tokens=10):
+    """Fast cache update for multi-turn: discover missing experts, swap them in.
+
+    Instead of the slow reset → re-warmup → upgrade cycle (~70s), keeps the
+    existing predictive cache and does a fast "delta discovery" pass:
+    1. Run discovery_tokens through predictive cache (~0.5s at 20 tok/s)
+    2. Collect which experts were requested but not cached
+    3. Evict cold experts, load missing ones from disk
+    4. One-time tensor rebuild per affected layer
+
+    Returns dict with timing breakdown and per-layer swap stats.
+    """
+    import mlx_lm as _mlx_lm
+    import time
+
+    model_path = Path(model_path)
+    shard_map = _build_shard_map(model_path)
+
+    # Clear stale indices from previous generation
+    for layer in model.layers:
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+        if isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            proj._cache._indices_buffer.clear()
+
+    # Step 1: Discovery pass at full speed through existing predictive cache
+    t0 = time.perf_counter()
+    _mlx_lm.generate(model, tokenizer, prompt=new_prompt,
+                     max_tokens=discovery_tokens, verbose=False)
+    t_discovery = time.perf_counter() - t0
+
+    # Step 2: Collect requested expert IDs and identify misses per layer
+    t1 = time.perf_counter()
+    layer_info = {}
+
+    for i, layer in enumerate(model.layers):
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+        if not isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            continue
+
+        cache = proj._cache
+
+        # Drain all buffered indices (generation complete, all evaluated)
+        all_requested = set()
+        for indices in cache._indices_buffer:
+            flat = np.asarray(indices.reshape(-1))
+            all_requested |= set(int(x) for x in np.unique(flat))
+        cache._indices_buffer.clear()
+
+        missing = all_requested - cache.cached_set
+
+        # Cold: cached but not requested, sorted by LCP priority (lowest first)
+        cold = sorted(
+            [(cache._lcp_priority(eid), slot, eid)
+             for slot, eid in enumerate(cache.cached_ids)
+             if eid not in all_requested],
+        )
+
+        layer_info[i] = {
+            "requested": all_requested,
+            "missing": missing,
+            "cold": cold,
+            "cache": cache,
+        }
+
+    # Step 3: Swap missing experts into cache, one layer at a time
+    total_swaps = 0
+    total_missing = 0
+    per_layer_stats = []
+
+    for i, info in layer_info.items():
+        missing = info["missing"]
+        cold = list(info["cold"])
+        cache = info["cache"]
+        total_missing += len(missing)
+
+        if not missing:
+            per_layer_stats.append({"layer": i, "missing": 0, "swapped": 0})
+            continue
+
+        swaps = []
+        for new_eid in sorted(missing):
+            if not cold:
+                break
+            _, slot, old_eid = cold.pop(0)
+            swaps.append((slot, old_eid, new_eid))
+
+        if not swaps:
+            per_layer_stats.append({"layer": i, "missing": len(missing), "swapped": 0})
+            continue
+
+        new_eids = mx.array([new_eid for _, _, new_eid in swaps])
+
+        # Batch-load new experts: group projections by shard to minimize disk reads
+        shard_groups = {}
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            sp = cache._shard_paths[proj_name]
+            shard_groups.setdefault(sp, []).append(
+                (proj_name, cache._key_prefixes[proj_name]))
+
+        new_experts = {}
+        to_eval_new = []
+        for shard_path, group in shard_groups.items():
+            shard = mx.load(shard_path)
+            for proj_name, key_prefix in group:
+                new_w = shard[f"{key_prefix}.weight"][new_eids]
+                new_s = shard[f"{key_prefix}.scales"][new_eids]
+                biases_key = f"{key_prefix}.biases"
+                new_b = shard[biases_key][new_eids] if biases_key in shard else None
+                new_experts[proj_name] = (new_w, new_s, new_b)
+                to_eval_new.extend([new_w, new_s])
+                if new_b is not None:
+                    to_eval_new.append(new_b)
+            del shard
+
+        # One eval per layer for all new experts (frees shard references)
+        mx.eval(*to_eval_new)
+
+        # Scatter update: write new experts directly into stacked tensors.
+        # pop() drops the dict ref so the buffer is singly-referenced,
+        # enabling MLX's buffer donation (zero-copy reuse) in the scatter op.
+        slot_indices = mx.array([slot for slot, _, _ in swaps])
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            new_w, new_s, new_b = new_experts[proj_name]
+
+            w = cache.weights.pop(proj_name)
+            w[slot_indices] = new_w
+            cache.weights[proj_name] = w
+
+            s = cache.scales.pop(proj_name)
+            s[slot_indices] = new_s
+            cache.scales[proj_name] = s
+
+            if cache.biases[proj_name] is not None and new_b is not None:
+                b = cache.biases.pop(proj_name)
+                b[slot_indices] = new_b
+                cache.biases[proj_name] = b
+
+        del new_experts
+
+        # Update cached_ids and rebuild lookup table
+        for slot, old_eid, new_eid in swaps:
+            cache.cached_set.discard(old_eid)
+            cache.cached_set.add(new_eid)
+            cache.cached_ids[slot] = new_eid
+            cache.frequency.pop(old_eid, None)
+            cache.last_active.pop(old_eid, None)
+
+        lookup_np = np.zeros(cache.num_experts, dtype=np.int32)
+        for slot, eid in enumerate(cache.cached_ids):
+            lookup_np[eid] = slot
+        cache.lookup = mx.array(lookup_np)
+
+        # Eval rebuilt tensors + lookup for this layer to free old tensor references.
+        # Without this, all 48 layers' old+new tensors coexist → OOM.
+        to_eval = [cache.lookup]
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            to_eval.append(cache.weights[proj_name])
+            to_eval.append(cache.scales[proj_name])
+            if cache.biases[proj_name] is not None:
+                to_eval.append(cache.biases[proj_name])
+        mx.eval(*to_eval)
+
+        total_swaps += len(swaps)
+        per_layer_stats.append({
+            "layer": i, "missing": len(missing), "swapped": len(swaps),
+        })
+
+    t_rebuild = time.perf_counter() - t1
+
+    # Reset fallback counters for clean generation stats
+    for layer in model.layers:
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+        if isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            proj._cache.total_requests = 0
+            proj._cache.total_fallbacks = 0
+            proj._cache._indices_buffer.clear()
+
+    mx.clear_cache()
+
+    return {
+        "discovery_time": t_discovery,
+        "rebuild_time": t_rebuild,
+        "total_time": t_discovery + t_rebuild,
+        "total_swaps": total_swaps,
+        "total_missing": total_missing,
+        "per_layer": per_layer_stats,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Adaptive per-layer capacity
+# ---------------------------------------------------------------------------
+
+def adaptive_capacity_upgrade(model, model_path, total_budget_experts,
+                              min_per_layer=32, sync=False):
+    """Compute per-layer capacities from LCP warmup and upgrade to predictive.
+
+    After LCP warmup, inspects each layer's discovered expert count and allocates
+    capacity proportionally (with 30% headroom), subject to total budget and min floor.
+    Layers that discover more experts get more capacity.
+
+    Returns dict with allocations, discovered counts, and memory estimate.
+    """
+    layer_counts = []
+    moe_layers = []
+
+    for i, layer in enumerate(model.layers):
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        proj = getattr(layer.mlp.switch_mlp, "gate_proj")
+        if not isinstance(proj, CachedQuantizedSwitchLinear):
+            continue
+        layer_counts.append(len(proj._cache.all_seen))
+        moe_layers.append(i)
+
+    n = len(layer_counts)
+
+    # Raw = discovered + 30% headroom, at least min_per_layer
+    raw = [max(min_per_layer, int(count * 1.3)) for count in layer_counts]
+    total_raw = sum(raw)
+
+    # Scale proportionally to fit total budget
+    scale = total_budget_experts / total_raw if total_raw > 0 else 1.0
+    capacities = [max(min_per_layer, min(512, round(r * scale))) for r in raw]
+
+    # Fine-tune to hit exact budget
+    diff = total_budget_experts - sum(capacities)
+    sorted_idx = sorted(range(n), key=lambda j: capacities[j], reverse=True)
+    for j in sorted_idx:
+        if diff == 0:
+            break
+        if diff > 0:
+            if capacities[j] < 512:
+                capacities[j] += 1
+                diff -= 1
+        elif capacities[j] > min_per_layer:
+            capacities[j] -= 1
+            diff += 1
+
+    upgraded = upgrade_to_predictive(model, model_path, capacities, sync=sync)
+
+    total_experts = sum(capacities)
+    estimated_gb = sum(c * 1.769 for c in capacities) / 1000
+
+    return {
+        "upgraded": upgraded,
+        "allocations": dict(zip(moe_layers, capacities)),
+        "discovered": dict(zip(moe_layers, layer_counts)),
+        "capacities": capacities,
+        "total_experts": total_experts,
+        "estimated_memory_gb": estimated_gb,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
+
+def measure_fallback(model) -> dict:
+    """Compute fallback stats by draining buffered indices post-generation.
+
+    Unlike get_fallback_stats() (which reads counters updated by cache.update()),
+    this directly inspects which requested expert IDs are not in the cached set.
+    Call after mlx_lm.generate() completes.
+    """
+    total_requests = 0
+    total_fallbacks = 0
+    layer_stats = []
+
+    for i, layer in enumerate(model.layers):
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+        if not isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            continue
+
+        cache = proj._cache
+        all_requested = set()
+        for indices in cache._indices_buffer:
+            flat = np.asarray(indices.reshape(-1))
+            all_requested |= set(int(x) for x in np.unique(flat))
+        cache._indices_buffer.clear()
+
+        missing = all_requested - cache.cached_set
+        n_req = len(all_requested)
+        n_fb = len(missing)
+        total_requests += n_req
+        total_fallbacks += n_fb
+
+        if n_req > 0:
+            layer_stats.append({
+                "layer": i,
+                "requested": n_req,
+                "missing": n_fb,
+                "fallback_rate": n_fb / n_req,
+            })
+
+    return {
+        "total_requests": total_requests,
+        "total_fallbacks": total_fallbacks,
+        "fallback_rate": total_fallbacks / total_requests if total_requests > 0 else 0.0,
+        "layers": layer_stats,
+    }
+
 
 def get_cache_stats(model) -> dict:
     """Collect hit/miss stats from all ExpertCache instances in the model."""
