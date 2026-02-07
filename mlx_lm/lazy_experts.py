@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -1377,6 +1378,250 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
         "discovery_method": discovery_method,
         "per_layer": per_layer_stats,
     }
+
+
+# ---------------------------------------------------------------------------
+# Incremental (async) delta warmup
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LayerSwapPlan:
+    layer_idx: int
+    cache: PredictiveExpertCache
+    swaps: list  # [(slot, old_eid, new_eid), ...]
+    miss_count: int
+
+    def __post_init__(self):
+        self.new_eids = mx.array([new_eid for _, _, new_eid in self.swaps])
+        self.slot_indices = mx.array([slot for slot, _, _ in self.swaps])
+
+
+class IncrementalDeltaWarmup:
+    """Progressive expert cache updates between tokens.
+
+    After discover(), call step() between generated tokens to incrementally
+    swap experts. Each step() builds lazy scatter graphs for N layers —
+    no mx.eval(), the forward pass evaluates them naturally.
+
+    Usage:
+        warmup = IncrementalDeltaWarmup(model, tokenizer, model_path)
+        stats = warmup.discover(new_prompt)
+
+        for response in mlx_lm.stream_generate(model, tokenizer, new_prompt, ...):
+            print(response.text, end='', flush=True)
+            if not warmup.is_complete:
+                warmup.step()
+    """
+
+    def __init__(self, model, tokenizer, model_path):
+        self._model = model
+        self._tokenizer = tokenizer
+        self._model_path = Path(model_path)
+        self._shard_map = _build_shard_map(self._model_path)
+        self._swap_queue: list[LayerSwapPlan] = []
+        self._layers_done = 0
+        self._swaps_done = 0
+        self._total_layers = 0
+        self._total_swaps = 0
+
+    def discover(self, prompt, tokens=10):
+        """Run discovery pass and compute swap plans.
+
+        Generates tokens through the existing predictive cache to discover
+        which experts the new prompt needs, then computes per-layer swap
+        plans sorted by miss count (highest first).
+
+        Returns dict with discovery stats.
+        """
+        import time
+        import mlx_lm as _mlx_lm
+
+        # Clear stale indices
+        for layer in self._model.layers:
+            if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+                continue
+            proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+            if isinstance(proj, (PredictiveCachedSwitchLinear,
+                                 SyncPredictiveCachedSwitchLinear)):
+                proj._cache._indices_buffer.clear()
+
+        t0 = time.perf_counter()
+        _mlx_lm.generate(self._model, self._tokenizer, prompt=prompt,
+                         max_tokens=tokens, verbose=False)
+
+        # Drain indices buffers
+        discovered = {}
+        for i, layer in enumerate(self._model.layers):
+            if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+                continue
+            proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+            if not isinstance(proj, (PredictiveCachedSwitchLinear,
+                                     SyncPredictiveCachedSwitchLinear)):
+                continue
+            cache = proj._cache
+            requested = set()
+            for indices in cache._indices_buffer:
+                flat = np.asarray(indices.reshape(-1))
+                requested |= set(int(x) for x in np.unique(flat))
+            cache._indices_buffer.clear()
+            discovered[i] = requested
+
+        t_discovery = time.perf_counter() - t0
+
+        # Compute swap plans
+        self._swap_queue = []
+        total_missing = 0
+
+        for i, layer in enumerate(self._model.layers):
+            if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+                continue
+            proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+            if not isinstance(proj, (PredictiveCachedSwitchLinear,
+                                     SyncPredictiveCachedSwitchLinear)):
+                continue
+
+            cache = proj._cache
+            requested = discovered.get(i, set())
+            missing = requested - cache.cached_set
+            total_missing += len(missing)
+
+            if not missing:
+                continue
+
+            cold = sorted(
+                [(cache._lcp_priority(eid), slot, eid)
+                 for slot, eid in enumerate(cache.cached_ids)
+                 if eid not in requested],
+            )
+
+            swaps = []
+            for new_eid in sorted(missing):
+                if not cold:
+                    break
+                _, slot, old_eid = cold.pop(0)
+                swaps.append((slot, old_eid, new_eid))
+
+            if swaps:
+                self._swap_queue.append(LayerSwapPlan(
+                    layer_idx=i, cache=cache,
+                    swaps=swaps, miss_count=len(missing),
+                ))
+
+        # Sort by miss count descending — fix highest-impact layers first
+        self._swap_queue.sort(key=lambda p: p.miss_count, reverse=True)
+        self._total_layers = len(self._swap_queue)
+        self._total_swaps = sum(p.miss_count for p in self._swap_queue)
+        self._layers_done = 0
+        self._swaps_done = 0
+
+        # Reset fallback counters
+        for layer in self._model.layers:
+            if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+                continue
+            proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+            if isinstance(proj, (PredictiveCachedSwitchLinear,
+                                 SyncPredictiveCachedSwitchLinear)):
+                proj._cache.total_requests = 0
+                proj._cache.total_fallbacks = 0
+                proj._cache._indices_buffer.clear()
+
+        return {
+            "discovery_time": t_discovery,
+            "total_layers": self._total_layers,
+            "total_swaps": self._total_swaps,
+            "total_missing": total_missing,
+        }
+
+    def step(self, layers_per_step=2):
+        """Swap experts for the next N layers. All lazy — no mx.eval().
+
+        Constructs scatter graphs that get evaluated naturally by the next
+        forward pass. Call between tokens in the generation loop.
+
+        Returns number of layers processed in this step.
+        """
+        processed = 0
+        for _ in range(layers_per_step):
+            if not self._swap_queue:
+                break
+
+            plan = self._swap_queue.pop(0)
+            cache = plan.cache
+
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                shard_path = cache._shard_paths[proj_name]
+                key_prefix = cache._key_prefixes[proj_name]
+                shard = mx.load(shard_path)
+
+                new_w = shard[f"{key_prefix}.weight"][plan.new_eids]
+                new_s = shard[f"{key_prefix}.scales"][plan.new_eids]
+                biases_key = f"{key_prefix}.biases"
+                new_b = shard[biases_key][plan.new_eids] if biases_key in shard else None
+                del shard
+
+                w = cache.weights.pop(proj_name)
+                w[plan.slot_indices] = new_w
+                cache.weights[proj_name] = w
+
+                s = cache.scales.pop(proj_name)
+                s[plan.slot_indices] = new_s
+                cache.scales[proj_name] = s
+
+                if cache.biases[proj_name] is not None and new_b is not None:
+                    b = cache.biases.pop(proj_name)
+                    b[plan.slot_indices] = new_b
+                    cache.biases[proj_name] = b
+
+            # Update lookup table
+            for slot, old_eid, new_eid in plan.swaps:
+                cache.cached_set.discard(old_eid)
+                cache.cached_set.add(new_eid)
+                cache.cached_ids[slot] = new_eid
+                cache.frequency.pop(old_eid, None)
+                cache.last_active.pop(old_eid, None)
+
+            lookup_np = np.zeros(cache.num_experts, dtype=np.int32)
+            for slot, eid in enumerate(cache.cached_ids):
+                lookup_np[eid] = slot
+            cache.lookup = mx.array(lookup_np)
+
+            self._layers_done += 1
+            self._swaps_done += len(plan.swaps)
+            processed += 1
+
+        return processed
+
+    @property
+    def is_complete(self):
+        return not self._swap_queue
+
+    @property
+    def remaining_layers(self):
+        return len(self._swap_queue)
+
+    @property
+    def total_layers(self):
+        return self._total_layers
+
+    @property
+    def progress(self):
+        return {
+            "layers_done": self._layers_done,
+            "layers_total": self._total_layers,
+            "swaps_done": self._swaps_done,
+            "swaps_total": self._total_swaps,
+        }
+
+
+def incremental_delta_warmup(model, tokenizer, model_path, new_prompt,
+                              discovery_tokens=10):
+    """Create an IncrementalDeltaWarmup and run discovery.
+
+    Returns the warmup object ready for step() calls between tokens.
+    """
+    warmup = IncrementalDeltaWarmup(model, tokenizer, model_path)
+    stats = warmup.discover(new_prompt, tokens=discovery_tokens)
+    return warmup, stats
 
 
 # ---------------------------------------------------------------------------
