@@ -1264,19 +1264,42 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
             # Scatter update for loaded projections (graph construction only,
             # eval deferred to lookup rebuild section)
             t_scatter_start = time.perf_counter()
-            for proj_name, (new_w, new_s, new_b) in loaded.items():
-                w = cache.weights.pop(proj_name)
-                w[slot_indices] = new_w
-                cache.weights[proj_name] = w
+            _use_scatter_slots = hasattr(mx.fast, "scatter_slots")
+            if _use_scatter_slots:
+                targets = []
+                values_list = []
+                proj_order = []
+                for proj_name, (new_w, new_s, new_b) in loaded.items():
+                    targets.append(cache.weights.pop(proj_name))
+                    values_list.append(new_w)
+                    proj_order.append((proj_name, "weights"))
 
-                s = cache.scales.pop(proj_name)
-                s[slot_indices] = new_s
-                cache.scales[proj_name] = s
+                    targets.append(cache.scales.pop(proj_name))
+                    values_list.append(new_s)
+                    proj_order.append((proj_name, "scales"))
 
-                if cache.biases[proj_name] is not None and new_b is not None:
-                    b = cache.biases.pop(proj_name)
-                    b[slot_indices] = new_b
-                    cache.biases[proj_name] = b
+                    if cache.biases[proj_name] is not None and new_b is not None:
+                        targets.append(cache.biases.pop(proj_name))
+                        values_list.append(new_b)
+                        proj_order.append((proj_name, "biases"))
+
+                results = mx.fast.scatter_slots(targets, slot_indices, values_list)
+                for (proj_name, tensor_type), result in zip(proj_order, results):
+                    getattr(cache, tensor_type)[proj_name] = result
+            else:
+                for proj_name, (new_w, new_s, new_b) in loaded.items():
+                    w = cache.weights.pop(proj_name)
+                    w[slot_indices] = new_w
+                    cache.weights[proj_name] = w
+
+                    s = cache.scales.pop(proj_name)
+                    s[slot_indices] = new_s
+                    cache.scales[proj_name] = s
+
+                    if cache.biases[proj_name] is not None and new_b is not None:
+                        b = cache.biases.pop(proj_name)
+                        b[slot_indices] = new_b
+                        cache.biases[proj_name] = b
             t_scatter += time.perf_counter() - t_scatter_start
 
         del shard
