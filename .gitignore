@@ -137,3 +137,6 @@ dmypy.json
 
 # .DS_Store files
 .DS_Store
+
+# flash-moe generated artifacts
+universal_experts.json

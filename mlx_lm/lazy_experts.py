@@ -150,10 +150,11 @@ class LazyQuantizedSwitchLinear(nn.Module):
     """
 
     def __init__(self, shard_path: str, key_prefix: str, group_size: int,
-                 bits: int, mode: str):
+                 bits: int, mode: str, shard_map: dict[str, str] | None = None):
         super().__init__()
         self._shard_path = shard_path
         self._key_prefix = key_prefix
+        self._shard_map = shard_map
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
@@ -162,11 +163,8 @@ class LazyQuantizedSwitchLinear(nn.Module):
     def _load_expert_subset(self, expert_ids: mx.array):
         """Load only the needed experts from the safetensors shard."""
         shard = mx.load(self._shard_path)
-        w = shard[f"{self._key_prefix}.weight"][expert_ids]
-        s = shard[f"{self._key_prefix}.scales"][expert_ids]
-        biases_key = f"{self._key_prefix}.biases"
-        b = shard[biases_key][expert_ids] if biases_key in shard else None
-        return w, s, b
+        return _load_proj_experts(shard, self._key_prefix, expert_ids,
+                                  shard_map=self._shard_map)
 
     def __call__(self, x, indices, sorted_indices=False):
         mx.eval(indices)
@@ -206,10 +204,12 @@ class CachedQuantizedSwitchLinear(nn.Module):
 
     def __init__(self, shard_path: str, key_prefix: str, group_size: int,
                  bits: int, mode: str, proj_name: str,
-                 cache: ExpertCache):
+                 cache: ExpertCache,
+                 shard_map: dict[str, str] | None = None):
         super().__init__()
         self._shard_path = shard_path
         self._key_prefix = key_prefix
+        self._shard_map = shard_map
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
@@ -240,10 +240,8 @@ class CachedQuantizedSwitchLinear(nn.Module):
         if miss_ids:
             miss_arr = mx.array(miss_ids)
             shard = mx.load(self._shard_path)
-            w_batch = shard[f"{self._key_prefix}.weight"][miss_arr]
-            s_batch = shard[f"{self._key_prefix}.scales"][miss_arr]
-            biases_key = f"{self._key_prefix}.biases"
-            b_batch = shard[biases_key][miss_arr] if biases_key in shard else None
+            w_batch, s_batch, b_batch = _load_proj_experts(shard, self._key_prefix, miss_arr,
+                                                            shard_map=self._shard_map)
             mx.eval(w_batch, s_batch) if b_batch is None else mx.eval(w_batch, s_batch, b_batch)
 
             for i, eid in enumerate(miss_ids):
@@ -313,7 +311,7 @@ class PredictiveExpertCache:
                  'cached_ids', 'cached_set',
                  'frequency', 'last_active', 'step',
                  '_indices_buffer',
-                 '_shard_paths', '_key_prefixes',
+                 '_shard_paths', '_key_prefixes', '_shard_map',
                  'total_requests', 'total_fallbacks',
                  'pinned_set')
 
@@ -332,6 +330,7 @@ class PredictiveExpertCache:
         self._indices_buffer: list[mx.array] = []
         self._shard_paths: dict[str, str] = {}
         self._key_prefixes: dict[str, str] = {}
+        self._shard_map: dict[str, str] | None = None
         self.total_requests: int = 0
         self.total_fallbacks: int = 0
         self.pinned_set: set[int] = set()
@@ -421,10 +420,8 @@ class PredictiveExpertCache:
             shard_path = self._shard_paths[proj_name]
             key_prefix = self._key_prefixes[proj_name]
             shard = mx.load(shard_path)
-            new_w = shard[f"{key_prefix}.weight"][new_eids]
-            new_s = shard[f"{key_prefix}.scales"][new_eids]
-            biases_key = f"{key_prefix}.biases"
-            new_b = shard[biases_key][new_eids] if biases_key in shard else None
+            new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
+                                                      shard_map=self._shard_map)
             del shard
 
             if new_b is None:
@@ -546,11 +543,133 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _build_shard_map(model_path: Path) -> dict[str, str]:
-    """Read model.safetensors.index.json and return {key: absolute_shard_path}."""
+    """Read model.safetensors.index.json and return {key: absolute_shard_path}.
+
+    For models with per-expert safetensors keys (e.g. Mixtral, GLM), adds
+    synthetic stacked-format keys so callers can look up
+    ``{prefix}.switch_mlp.gate_proj.weight`` even though the actual file
+    stores ``{prefix}.experts.0.w1.weight``.  The shard path returned is
+    expert 0's shard (all experts for a layer share a shard).
+    """
     index_path = model_path / "model.safetensors.index.json"
     with open(index_path) as f:
         weight_map = json.load(f)["weight_map"]
-    return {key: str(model_path / shard) for key, shard in weight_map.items()}
+
+    shard_map = {key: str(model_path / shard) for key, shard in weight_map.items()}
+
+    # Detect per-expert format and add synthetic stacked keys.
+    # Two naming conventions:
+    #   Mixtral:  {prefix}.experts.0.w1.weight  (w1->gate, w2->down, w3->up)
+    #   GLM/DS:   {prefix}.experts.0.gate_proj.weight
+    _w_to_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+    seen_expert_prefixes: set[str] = set()
+    for key in weight_map:
+        if ".experts.0." not in key:
+            continue
+        # e.g. "model.layers.0.block_sparse_moe.experts.0.w1.weight"
+        # Split into prefix, "experts", "0", sub_name, weight_type
+        idx = key.index(".experts.0.")
+        moe_prefix = key[:idx]  # "model.layers.0.block_sparse_moe"
+        remainder = key[idx + len(".experts.0."):]  # "w1.weight"
+        parts = remainder.split(".")
+        if len(parts) != 2:
+            continue
+        sub_name, wt = parts  # ("w1", "weight")
+        proj_name = _w_to_proj.get(sub_name, sub_name)
+        synth_key = f"{moe_prefix}.switch_mlp.{proj_name}.{wt}"
+        if synth_key not in shard_map:
+            shard_map[synth_key] = str(model_path / weight_map[key])
+            seen_expert_prefixes.add(moe_prefix)
+
+    return shard_map
+
+
+# Mapping from canonical projection names to per-expert sub-names.
+_PROJ_TO_EXPERT_NAMES = {
+    "gate_proj": ("gate_proj", "w1"),
+    "up_proj": ("up_proj", "w3"),
+    "down_proj": ("down_proj", "w2"),
+}
+
+
+def _load_proj_experts(shard: dict, key_prefix: str, expert_ids,
+                       shard_map: dict[str, str] | None = None,
+                       ) -> tuple[mx.array, mx.array, mx.array | None]:
+    """Load weight/scales/biases for ``expert_ids`` from a safetensors shard.
+
+    Handles both:
+      - **Stacked format** (Qwen): ``{key_prefix}.weight`` is a (E, ...) tensor.
+      - **Per-expert format** (Mixtral, GLM): individual keys like
+        ``{moe_base}.experts.{e}.{sub}.weight``.
+
+    For per-expert format, some experts may live in a different shard file.
+    Pass ``shard_map`` (from ``_build_shard_map``) to enable cross-shard
+    loading.  Extra shards are loaded on demand and freed immediately.
+    """
+    stacked_key = f"{key_prefix}.weight"
+    if stacked_key in shard:
+        w = shard[stacked_key][expert_ids]
+        s = shard[f"{key_prefix}.scales"][expert_ids]
+        biases_key = f"{key_prefix}.biases"
+        b = shard[biases_key][expert_ids] if biases_key in shard else None
+        return w, s, b
+
+    # Per-expert format: key_prefix is e.g.
+    #   "model.layers.0.block_sparse_moe.switch_mlp.gate_proj"
+    # We need to map back to "model.layers.0.block_sparse_moe.experts.{e}.w1"
+    parts = key_prefix.rsplit(".", 1)  # ("...switch_mlp", "gate_proj")
+    switch_prefix = parts[0]  # "...switch_mlp"
+    proj_name = parts[1]  # "gate_proj"
+    moe_base = switch_prefix.rsplit(".switch_mlp", 1)[0]  # "...block_sparse_moe"
+
+    candidates = _PROJ_TO_EXPERT_NAMES.get(proj_name, (proj_name,))
+
+    ids = np.asarray(expert_ids).reshape(-1) if not isinstance(expert_ids, np.ndarray) else expert_ids.reshape(-1)
+
+    # Cache for extra shards loaded on demand (path -> lazy dict)
+    _extra_shards: dict[str, dict] = {}
+
+    def _resolve_shard(expert_key: str) -> dict:
+        """Return the shard dict containing ``expert_key``."""
+        if expert_key in shard:
+            return shard
+        if shard_map is None:
+            return shard  # caller didn't provide map; fall through to KeyError
+        alt_path = shard_map.get(expert_key)
+        if alt_path is None:
+            return shard
+        if alt_path not in _extra_shards:
+            _extra_shards[alt_path] = mx.load(alt_path)
+        return _extra_shards[alt_path]
+
+    ws, ss, bs = [], [], []
+    has_bias = None
+    for eid in ids:
+        eid = int(eid)
+        loaded = False
+        for sub in candidates:
+            expert_key = f"{moe_base}.experts.{eid}.{sub}.weight"
+            s_dict = _resolve_shard(expert_key)
+            if expert_key in s_dict:
+                ws.append(s_dict[expert_key])
+                ss.append(s_dict[f"{moe_base}.experts.{eid}.{sub}.scales"])
+                b_key = f"{moe_base}.experts.{eid}.{sub}.biases"
+                if has_bias is None:
+                    has_bias = b_key in s_dict
+                if has_bias:
+                    bs.append(s_dict[b_key])
+                loaded = True
+                break
+        if not loaded:
+            raise KeyError(
+                f"No expert key found for expert {eid}, "
+                f"tried: {[f'{moe_base}.experts.{eid}.{s}.weight' for s in candidates]}"
+            )
+
+    w = mx.stack(ws)
+    s = mx.stack(ss)
+    b = mx.stack(bs) if has_bias else None
+    return w, s, b
 
 
 def enable_lazy_experts(model, model_path: Path, cache_capacity_per_layer: int = 0,
@@ -597,6 +716,7 @@ def _enable_lazy(model, shard_map: dict, ) -> int:
                 group_size=orig.group_size,
                 bits=orig.bits,
                 mode=orig.mode,
+                shard_map=shard_map,
             )
             setattr(switch, name, replacement)
             replaced += 1
@@ -624,6 +744,7 @@ def _enable_cached(model, shard_map: dict, capacity: int) -> int:
                 mode=orig.mode,
                 proj_name=name,
                 cache=layer_cache,
+                shard_map=shard_map,
             )
             setattr(switch, name, replacement)
             replaced += 1
@@ -667,6 +788,7 @@ def reset_to_cached(model, model_path: Path, capacity: int) -> int:
                 mode=pred_mod.mode,
                 proj_name=name,
                 cache=layer_cache,
+                shard_map=shard_map,
             )
             setattr(switch, name, replacement)
             reset += 1
@@ -789,10 +911,8 @@ def upgrade_to_predictive(model, model_path: Path, capacity,
             to_eval = []
             for name, key_prefix, slot_eids in layer_entries:
                 load_ids = mx.array([eid for _, eid in slot_eids])
-                w_batch = shard[f"{key_prefix}.weight"][load_ids]
-                s_batch = shard[f"{key_prefix}.scales"][load_ids]
-                biases_key = f"{key_prefix}.biases"
-                b_batch = shard[biases_key][load_ids] if biases_key in shard else None
+                w_batch, s_batch, b_batch = _load_proj_experts(shard, key_prefix, load_ids,
+                                                              shard_map=shard_map)
                 to_eval.extend([w_batch, s_batch])
                 if b_batch is not None:
                     to_eval.append(b_batch)
@@ -842,6 +962,7 @@ def upgrade_to_predictive(model, model_path: Path, capacity,
             key_prefix = f"{key_base}.{name}"
             pred_cache._shard_paths[name] = shard_map[f"{key_prefix}.weight"]
             pred_cache._key_prefixes[name] = key_prefix
+        pred_cache._shard_map = shard_map
 
         pred_cache.build_lookup(cached_ids)
         mx.eval(pred_cache.lookup)
@@ -1091,10 +1212,8 @@ def delta_warmup(model, tokenizer, model_path, new_prompt, discovery_tokens=10):
             layer_entries = [(pn, kp, eids) for li, pn, kp, eids in group if li == layer_i]
             to_eval = []
             for proj_name, key_prefix, new_eids in layer_entries:
-                new_w = shard[f"{key_prefix}.weight"][new_eids]
-                new_s = shard[f"{key_prefix}.scales"][new_eids]
-                biases_key = f"{key_prefix}.biases"
-                new_b = shard[biases_key][new_eids] if biases_key in shard else None
+                new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
+                                                          shard_map=shard_map)
                 loaded_experts.setdefault(layer_i, {})[proj_name] = (new_w, new_s, new_b)
                 to_eval.extend([new_w, new_s])
                 if new_b is not None:
@@ -1231,6 +1350,15 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
 
     t_discovery = time.perf_counter() - t0
 
+    # Memory pressure check: reduce swap throughput if close to device limit
+    device_mem = mx.metal.device_info()["memory_size"]
+    active_mem = mx.metal.get_active_memory()
+    memory_pressure = active_mem > 0.85 * device_mem
+    MAX_SWAPS_PER_LAYER = 3 if memory_pressure else 10
+    if memory_pressure:
+        print(f"  [memory pressure: {active_mem / 1e9:.1f}/{device_mem / 1e9:.0f} GB — "
+              f"limiting to {MAX_SWAPS_PER_LAYER} swaps/layer]")
+
     # Step 2: Compute delta (missing experts per layer, cold slots to evict)
     t1 = time.perf_counter()
     total_swaps = 0
@@ -1270,6 +1398,8 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
                 break
             _, slot, old_eid = cold.pop(0)
             swaps.append((slot, old_eid, new_eid))
+
+        swaps = swaps[:MAX_SWAPS_PER_LAYER]
 
         if not swaps:
             per_layer_stats.append({"layer": i, "missing": len(missing), "swapped": 0})
@@ -1312,10 +1442,8 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
                 key_prefix = cache._key_prefixes[proj_name]
                 if cache._shard_paths[proj_name] != shard_path:
                     continue
-                new_w = shard[f"{key_prefix}.weight"][new_eids]
-                new_s = shard[f"{key_prefix}.scales"][new_eids]
-                biases_key = f"{key_prefix}.biases"
-                new_b = shard[biases_key][new_eids] if biases_key in shard else None
+                new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
+                                                          shard_map=cache._shard_map)
                 loaded[proj_name] = (new_w, new_s, new_b)
                 to_eval.extend([new_w, new_s])
                 if new_b is not None:
@@ -1485,6 +1613,7 @@ class IncrementalDeltaWarmup:
         self._swaps_done = 0
         self._total_layers = 0
         self._total_swaps = 0
+        self._memory_pressure = False
 
     def discover(self, prompt, tokens=10):
         """Run discovery pass and compute swap plans.
@@ -1533,9 +1662,20 @@ class IncrementalDeltaWarmup:
 
         t_discovery = time.perf_counter() - t0
 
+        # Memory pressure check: limit swaps per layer if near device limit.
+        # Each swap loads a shard (~336 MB transient), so under pressure we
+        # process fewer swaps per step() to avoid pushing past the cliff.
+        device_mem = mx.metal.device_info()["memory_size"]
+        active_mem = mx.metal.get_active_memory()
+        self._memory_pressure = active_mem > 0.85 * device_mem
+        if self._memory_pressure:
+            print(f"  [memory pressure: {active_mem / 1e9:.1f}/{device_mem / 1e9:.0f} GB — "
+                  f"swap plans will be trimmed]")
+
         # Compute swap plans
         self._swap_queue = []
         total_missing = 0
+        max_swaps_per_plan = 3 if self._memory_pressure else 999
 
         for i, layer in enumerate(self._model.layers):
             switch, _ = _find_switch_mlp(layer, i)
@@ -1566,6 +1706,8 @@ class IncrementalDeltaWarmup:
                     break
                 _, slot, old_eid = cold.pop(0)
                 swaps.append((slot, old_eid, new_eid))
+
+            swaps = swaps[:max_swaps_per_plan]
 
             if swaps:
                 self._swap_queue.append(LayerSwapPlan(
@@ -1619,11 +1761,8 @@ class IncrementalDeltaWarmup:
                 shard_path = cache._shard_paths[proj_name]
                 key_prefix = cache._key_prefixes[proj_name]
                 shard = mx.load(shard_path)
-
-                new_w = shard[f"{key_prefix}.weight"][plan.new_eids]
-                new_s = shard[f"{key_prefix}.scales"][plan.new_eids]
-                biases_key = f"{key_prefix}.biases"
-                new_b = shard[biases_key][plan.new_eids] if biases_key in shard else None
+                new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, plan.new_eids,
+                                                          shard_map=cache._shard_map)
                 del shard
 
                 w = cache.weights.pop(proj_name)
@@ -2213,6 +2352,25 @@ def upgrade_from_saved_state(model, model_path, cache_state, capacity, sync=Fals
 
     Returns number of modules upgraded.
     """
+    # Memory guard: check if projected expert memory fits in 85% of device RAM
+    num_moe_layers = sum(
+        1 for layer in model.layers
+        if _find_switch_mlp(layer)[0] is not None
+    )
+    expert_slot_mb = 1.69
+    base_memory_gb = mx.metal.get_active_memory() / 1e9
+    projected_gb = base_memory_gb + capacity * num_moe_layers * expert_slot_mb / 1024
+    device_gb = mx.metal.device_info()["memory_size"] / 1e9
+    limit_gb = 0.85 * device_gb
+
+    if projected_gb > limit_gb:
+        max_capacity = int((limit_gb - base_memory_gb) * 1024 / (num_moe_layers * expert_slot_mb))
+        max_capacity = (max_capacity // 8) * 8
+        max_capacity = max(max_capacity, 0)
+        print(f"  [memory guard: {projected_gb:.1f} GB projected > {limit_gb:.1f} GB limit — "
+              f"reducing capacity {capacity} -> {max_capacity}]")
+        capacity = max_capacity
+
     layers_data = cache_state["layers"]
 
     for i, layer in enumerate(model.layers):
@@ -2376,10 +2534,8 @@ def upgrade_to_predictive_with_pinning(model, model_path, capacity,
             to_eval = []
             for name, key_prefix, slot_eids in layer_entries:
                 load_ids = mx.array([eid for _, eid in slot_eids])
-                w_batch = shard[f"{key_prefix}.weight"][load_ids]
-                s_batch = shard[f"{key_prefix}.scales"][load_ids]
-                biases_key = f"{key_prefix}.biases"
-                b_batch = shard[biases_key][load_ids] if biases_key in shard else None
+                w_batch, s_batch, b_batch = _load_proj_experts(shard, key_prefix, load_ids,
+                                                              shard_map=shard_map)
                 to_eval.extend([w_batch, s_batch])
                 if b_batch is not None:
                     to_eval.append(b_batch)
@@ -2427,6 +2583,7 @@ def upgrade_to_predictive_with_pinning(model, model_path, capacity,
             key_prefix = f"{key_base}.{name}"
             pred_cache._shard_paths[name] = shard_map[f"{key_prefix}.weight"]
             pred_cache._key_prefixes[name] = key_prefix
+        pred_cache._shard_map = shard_map
 
         pred_cache.build_lookup(cached_ids)
         pred_cache.pinned_set = meta["pinned_set"]
@@ -2549,6 +2706,114 @@ def compute_adaptive_allocations(layer_profiles, total_budget, min_per_layer=32)
 
 
 # ---------------------------------------------------------------------------
+# Production one-call API
+# ---------------------------------------------------------------------------
+
+def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
+                   profile_path=None):
+    """One-call generation with all optimizations.
+
+    Auto-detects RAM, selects capacity, loads cached state if available,
+    applies pinning if profile exists, uses cache_limit(0) during warmup,
+    coherent stream mode for delta switches.
+
+    Args:
+        model_name: HuggingFace model name (e.g. "mlx-community/Qwen3-Coder-Next-4bit").
+        prompt: Text prompt for generation.
+        max_tokens: Maximum tokens to generate.
+        cache_dir: Directory for cache state persistence. None disables caching.
+        profile_path: Path to universal expert profile JSON for pinning.
+
+    Returns:
+        Generated text string.
+    """
+    import os
+    import mlx_lm as _mlx_lm
+    from mlx_lm.utils import hf_repo_to_path
+
+    model_path = hf_repo_to_path(model_name)
+    model, tokenizer = _mlx_lm.load(model_name, lazy=True)
+
+    # Count MoE layers and detect expert count
+    num_moe_layers = 0
+    num_experts = 512
+    for layer in model.layers:
+        switch, _ = _find_switch_mlp(layer)
+        if switch is not None:
+            num_moe_layers += 1
+            num_experts = _detect_num_experts(switch)
+
+    # Auto-select capacity based on device memory
+    device_gb = mx.metal.device_info()["memory_size"] / 1e9
+    base_model_gb = 1.4  # non-expert params for typical 4-bit MoE
+    capacity = select_capacity(base_model_gb, device_gb,
+                               num_moe_layers=num_moe_layers)
+
+    enable_lazy_experts(model, model_path,
+                        cache_capacity_per_layer=capacity,
+                        predictive=True)
+    mx.eval(model.parameters())
+
+    # Memory guard: verify projected expert memory fits
+    active_gb = mx.metal.get_active_memory() / 1e9
+    expert_slot_mb = 1.69
+    projected_gb = active_gb + capacity * num_moe_layers * expert_slot_mb / 1024
+    limit_gb = 0.85 * device_gb
+    if projected_gb > limit_gb:
+        max_cap = int((limit_gb - active_gb) * 1024 / (num_moe_layers * expert_slot_mb))
+        capacity = (max_cap // 8) * 8
+        capacity = max(capacity, 0)
+        print(f"  [memory guard: reducing capacity to {capacity}]")
+        # Reinstall with reduced capacity
+        enable_lazy_experts(model, model_path,
+                            cache_capacity_per_layer=capacity,
+                            predictive=True)
+        mx.eval(model.parameters())
+
+    # Resolve cache file path
+    cache_path = None
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        safe_name = model_name.replace("/", "--")
+        cache_path = os.path.join(cache_dir, f"{safe_name}.json")
+
+    # Try to load from saved state
+    used_saved_state = False
+    if cache_path and os.path.exists(cache_path):
+        cache_state = load_cache_state(cache_path)
+        upgraded = upgrade_from_saved_state(model, model_path, cache_state,
+                                            capacity)
+
+        # Delta warmup if prompt differs from saved
+        saved_prompt = cache_state.get("metadata", {}).get("prompt")
+        if saved_prompt and saved_prompt != prompt:
+            with _with_cache_limit_zero():
+                fast_delta_warmup(model, tokenizer, model_path, prompt,
+                                  discovery_tokens=10)
+        used_saved_state = True
+    else:
+        # Cold path: warmup generation + upgrade
+        with _with_cache_limit_zero():
+            _mlx_lm.generate(model, tokenizer, prompt=prompt,
+                             max_tokens=10, verbose=False)
+
+        if profile_path is not None:
+            profile = load_universal_profile(profile_path)
+            upgrade_to_predictive_with_pinning(model, model_path, capacity,
+                                               profile)
+        else:
+            upgrade_to_predictive(model, model_path, capacity)
+
+    # Save state for next run
+    if cache_path and not used_saved_state:
+        save_cache_state(model, cache_path,
+                         metadata={"prompt": prompt, "capacity": capacity})
+
+    return _mlx_lm.generate(model, tokenizer, prompt=prompt,
+                             max_tokens=max_tokens, verbose=False)
+
+
+# ---------------------------------------------------------------------------
 # ML-based cache replacement (Task 5)
 # ---------------------------------------------------------------------------
 
@@ -2645,10 +2910,8 @@ def dynamic_cache_update_ml(model, eviction_models, max_layer_updates=12):
             shard_path = cache._shard_paths[proj_name]
             key_prefix = cache._key_prefixes[proj_name]
             shard = mx.load(shard_path)
-            new_w = shard[f"{key_prefix}.weight"][new_eids]
-            new_s = shard[f"{key_prefix}.scales"][new_eids]
-            biases_key = f"{key_prefix}.biases"
-            new_b = shard[biases_key][new_eids] if biases_key in shard else None
+            new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
+                                                      shard_map=cache._shard_map)
             del shard
 
             if new_b is None:
