@@ -2060,6 +2060,107 @@ def router_only_forward(model, tokenizer, prompt, max_tokens=10):
     return collected
 
 
+def router_only_discovery(model, tokenizer, prompt, max_tokens=10):
+    """Fast cold-start discovery: run routers only, populate Phase 2 caches.
+
+    Like router_only_forward() but batches all mx.eval to the end instead of
+    sync-ing per layer per token (480 sync points -> 1). Populates the
+    CachedQuantizedSwitchLinear caches so upgrade_to_predictive() can use them.
+
+    Returns dict[layer_idx, set[expert_id]].
+    """
+    import mlx_lm as _mlx_lm
+
+    collected: dict[int, list[mx.array]] = {}
+    moe_blocks: dict[int, int] = {}
+
+    for i, layer in enumerate(model.layers):
+        block = _find_moe_block(layer)
+        if block is not None and hasattr(block, "switch_mlp"):
+            moe_blocks[id(block)] = i
+            collected[i] = []
+
+    if not moe_blocks:
+        return {}
+
+    type_to_blocks: dict[type, list] = {}
+    for i, layer in enumerate(model.layers):
+        block = _find_moe_block(layer)
+        if block is not None and id(block) in moe_blocks:
+            type_to_blocks.setdefault(type(block), []).append(block)
+
+    original_calls: dict[type, object] = {}
+
+    def _make_skip_call(block_map, orig_call):
+        def _skip(self, x):
+            layer_idx = block_map.get(id(self))
+            if layer_idx is None:
+                return orig_call(self, x)
+
+            gates = self.gate(x)
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            k = self.top_k
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            collected[layer_idx].append(inds)
+
+            if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
+                shared_y = self.shared_expert(x)
+                shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+                return shared_y
+            elif hasattr(self, "shared_expert"):
+                return self.shared_expert(x)
+            else:
+                return mx.zeros_like(x)
+        return _skip
+
+    for block_type, blocks in type_to_blocks.items():
+        original_calls[block_type] = block_type.__call__
+        block_type.__call__ = _make_skip_call(moe_blocks, original_calls[block_type])
+
+    try:
+        _mlx_lm.generate(model, tokenizer, prompt=prompt,
+                         max_tokens=max_tokens, verbose=False)
+    finally:
+        for block_type, orig in original_calls.items():
+            block_type.__call__ = orig
+
+    # One bulk eval for all collected indices
+    all_tensors = []
+    for inds_list in collected.values():
+        all_tensors.extend(inds_list)
+    if all_tensors:
+        mx.eval(*all_tensors)
+
+    # Flatten into sets and populate Phase 2 caches
+    result: dict[int, set[int]] = {}
+    for i, inds_list in collected.items():
+        expert_counts: dict[int, int] = {}
+        for inds in inds_list:
+            flat = np.asarray(inds.reshape(-1))
+            for eid in flat:
+                eid = int(eid)
+                expert_counts[eid] = expert_counts.get(eid, 0) + 1
+        result[i] = set(expert_counts.keys())
+
+        # Populate Phase 2 LCP cache
+        layer = model.layers[i]
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "gate_proj", None)
+        if not isinstance(proj, CachedQuantizedSwitchLinear):
+            continue
+        cache = proj._cache
+        for eid, count in expert_counts.items():
+            cache.entries[eid] = {}
+            cache.frequency[eid] = count
+            cache.last_active[eid] = max_tokens
+            cache.all_seen.add(eid)
+        cache.step = max_tokens
+
+    return result
+
+
 def speculative_router_probe(model, tokenizer, prompt, max_tokens=10):
     """Skip-MoE forward, then probe each router on ALL layers' hidden states.
 
@@ -2339,6 +2440,155 @@ def load_cache_state(path):
     return state
 
 
+def save_prepacked_weights(model, path):
+    """Save pre-stacked predictive cache weights to safetensors for fast warm start.
+
+    After upgrade_to_predictive(), the PredictiveExpertCache objects have stacked
+    weight/scale/bias tensors in Metal memory. Save them to disk so the next warm
+    start can load_prepacked_weights() and skip the entire upgrade_to_predictive().
+
+    Convention: cache at "foo.json" -> weights at "foo.weights.safetensors",
+    metadata at "foo.weights.meta.json".
+    """
+    path = Path(path)
+    tensors: dict[str, mx.array] = {}
+    meta_layers: dict[str, dict] = {}
+
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "gate_proj", None)
+        if not isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            continue
+
+        cache = proj._cache
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"layer.{i}.{proj_name}.weight"] = cache.weights[proj_name]
+            tensors[f"layer.{i}.{proj_name}.scales"] = cache.scales[proj_name]
+            if cache.biases[proj_name] is not None:
+                tensors[f"layer.{i}.{proj_name}.biases"] = cache.biases[proj_name]
+
+        meta_layers[str(i)] = {
+            "cached_ids": list(cache.cached_ids),
+            "num_experts": cache.num_experts,
+            "pinned_set": sorted(cache.pinned_set),
+            "frequency": {str(k): v for k, v in cache.frequency.items()},
+            "last_active": {str(k): v for k, v in cache.last_active.items()},
+            "step": cache.step,
+        }
+
+    mx.save_safetensors(str(path), tensors)
+
+    meta_path = Path(str(path) + ".meta.json")
+    with open(meta_path, "w") as f:
+        json.dump({"version": 1, "layers": meta_layers}, f)
+
+    print(f"  Saved prepacked weights: {path} ({len(tensors)} tensors, "
+          f"{len(meta_layers)} layers)")
+
+
+def load_prepacked_weights(model, prepacked_path, model_path=None):
+    """Load pre-stacked predictive cache from safetensors, skipping upgrade_to_predictive().
+
+    The model must already have Phase 2 modules installed (enable_lazy_experts with
+    predictive=True). This replaces them with PredictiveCachedSwitchLinear using the
+    pre-packed tensors directly.
+
+    Returns number of modules upgraded.
+    """
+    prepacked_path = Path(prepacked_path)
+    meta_path = Path(str(prepacked_path) + ".meta.json")
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    packed = mx.load(str(prepacked_path))
+
+    shard_map = None
+    if model_path is not None:
+        shard_map = _build_shard_map(Path(model_path))
+
+    upgraded = 0
+    layers_processed = 0
+    batch_eval: list[mx.array] = []
+
+    for layer_str, layer_meta in meta["layers"].items():
+        i = int(layer_str)
+        layer = model.layers[i]
+        switch, key_base = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+
+        cached_ids = layer_meta["cached_ids"]
+        num_experts = layer_meta["num_experts"]
+        capacity = len(cached_ids)
+
+        pred_cache = PredictiveExpertCache(capacity, num_experts)
+
+        # Grab group_size/bits/mode from current Phase 2 module
+        phase2_mod = getattr(switch, "gate_proj")
+
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            w_key = f"layer.{i}.{proj_name}.weight"
+            s_key = f"layer.{i}.{proj_name}.scales"
+            b_key = f"layer.{i}.{proj_name}.biases"
+
+            pred_cache.weights[proj_name] = packed[w_key]
+            pred_cache.scales[proj_name] = packed[s_key]
+            pred_cache.biases[proj_name] = packed[b_key] if b_key in packed else None
+
+            batch_eval.append(pred_cache.weights[proj_name])
+            batch_eval.append(pred_cache.scales[proj_name])
+            if pred_cache.biases[proj_name] is not None:
+                batch_eval.append(pred_cache.biases[proj_name])
+
+        pred_cache.build_lookup(cached_ids)
+        batch_eval.append(pred_cache.lookup)
+
+        pred_cache.pinned_set = set(layer_meta.get("pinned_set", []))
+        pred_cache.frequency = {int(k): v for k, v in layer_meta.get("frequency", {}).items()}
+        pred_cache.last_active = {int(k): v for k, v in layer_meta.get("last_active", {}).items()}
+        pred_cache.step = layer_meta.get("step", 0)
+
+        if shard_map is not None and key_base is not None:
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                key_prefix = f"{key_base}.{proj_name}"
+                pred_cache._shard_paths[proj_name] = shard_map[f"{key_prefix}.weight"]
+                pred_cache._key_prefixes[proj_name] = key_prefix
+            pred_cache._shard_map = shard_map
+
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            p2 = getattr(switch, proj_name)
+            replacement = PredictiveCachedSwitchLinear(
+                group_size=p2.group_size,
+                bits=p2.bits,
+                mode=p2.mode,
+                proj_name=proj_name,
+                cache=pred_cache,
+            )
+            setattr(switch, proj_name, replacement)
+            upgraded += 1
+
+        layers_processed += 1
+
+        # Eval in chunks of 8 layers to bound transient memory
+        if layers_processed % 8 == 0:
+            mx.eval(*batch_eval)
+            batch_eval = []
+            print(f"  Prepacked load: {layers_processed} layers "
+                  f"({mx.get_active_memory() / 1e9:.1f} GB)")
+
+    if batch_eval:
+        mx.eval(*batch_eval)
+
+    del packed
+
+    print(f"  Prepacked load complete: {layers_processed} layers, {upgraded} modules "
+          f"({mx.get_active_memory() / 1e9:.1f} GB)")
+    return upgraded
+
+
 def upgrade_from_saved_state(model, model_path, cache_state, capacity, sync=False):
     """Skip warmup: build predictive cache directly from saved state.
 
@@ -2613,6 +2863,77 @@ def upgrade_to_predictive_with_pinning(model, model_path, capacity,
     return upgraded
 
 
+def upgrade_from_profile(model, model_path, capacity, profile, pin_threshold=0.5):
+    """Profile-based cold start: skip discovery, use profile's top experts directly.
+
+    When a universal expert profile exists, populates Phase 2 caches from the
+    profile's activation counts and calls upgrade_to_predictive(). Experts above
+    pin_threshold are marked pinned after upgrade.
+
+    The model must already have Phase 2 modules installed (enable_lazy_experts
+    with predictive=True).
+
+    Returns number of modules upgraded.
+    """
+    model_path = Path(model_path)
+    num_prompts = profile["num_prompts"]
+    min_count = int(pin_threshold * num_prompts)
+
+    moe_idx = 0
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "gate_proj", None)
+        if not isinstance(proj, CachedQuantizedSwitchLinear):
+            continue
+
+        layer_data = profile["layers"].get(str(i))
+        if layer_data is None:
+            moe_idx += 1
+            continue
+
+        counts = layer_data.get("activation_counts", {})
+        sorted_experts = sorted(
+            ((int(eid), int(cnt)) for eid, cnt in counts.items()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        cache = proj._cache
+        for eid, count in sorted_experts:
+            cache.entries[eid] = {}
+            cache.frequency[eid] = count
+            cache.last_active[eid] = 1
+            cache.all_seen.add(eid)
+        cache.step = 1
+        moe_idx += 1
+
+    upgraded = upgrade_to_predictive(model, model_path, capacity)
+
+    # Set pinned_set on the newly-installed PredictiveExpertCaches
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "gate_proj", None)
+        if not isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            continue
+
+        layer_data = profile["layers"].get(str(i))
+        if layer_data is None:
+            continue
+
+        counts = layer_data.get("activation_counts", {})
+        pinned = set(
+            int(eid) for eid, cnt in counts.items()
+            if int(cnt) >= min_count
+        )
+        proj._cache.pinned_set = pinned & proj._cache.cached_set
+
+    return upgraded
+
+
 # ---------------------------------------------------------------------------
 # Per-layer adaptive cache budget via MoEpic greedy (Task 6)
 # ---------------------------------------------------------------------------
@@ -2710,12 +3031,20 @@ def compute_adaptive_allocations(layer_profiles, total_budget, min_per_layer=32)
 # ---------------------------------------------------------------------------
 
 def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
-                   profile_path=None):
+                   profile_path=None, prepacked=True):
     """One-call generation with all optimizations.
 
     Auto-detects RAM, selects capacity, loads cached state if available,
     applies pinning if profile exists, uses cache_limit(0) during warmup,
     coherent stream mode for delta switches.
+
+    Warm start priority:
+      1. Prepacked weights (fastest: skip upgrade_to_predictive entirely)
+      2. Saved cache state (reload expert weights from safetensors shards)
+
+    Cold start priority:
+      1. Profile-based (skip discovery, use profile's top experts)
+      2. Router-only discovery (fast ~1-2s vs ~75s full model discovery)
 
     Args:
         model_name: HuggingFace model name (e.g. "mlx-community/Qwen3-Coder-Next-4bit").
@@ -2723,18 +3052,22 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
         max_tokens: Maximum tokens to generate.
         cache_dir: Directory for cache state persistence. None disables caching.
         profile_path: Path to universal expert profile JSON for pinning.
+        prepacked: Save/load prepacked weight files for fastest warm start.
 
     Returns:
         Generated text string.
     """
     import os
+    import time
     import mlx_lm as _mlx_lm
     from mlx_lm.utils import hf_repo_to_path
 
+    t_total_start = time.perf_counter()
+
     model_path = hf_repo_to_path(model_name)
+    t0 = time.perf_counter()
     model, tokenizer = _mlx_lm.load(model_name, lazy=True)
 
-    # Count MoE layers and detect expert count
     num_moe_layers = 0
     num_experts = 512
     for layer in model.layers:
@@ -2743,9 +3076,8 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
             num_moe_layers += 1
             num_experts = _detect_num_experts(switch)
 
-    # Auto-select capacity based on device memory
     device_gb = mx.metal.device_info()["memory_size"] / 1e9
-    base_model_gb = 1.4  # non-expert params for typical 4-bit MoE
+    base_model_gb = 1.4
     capacity = select_capacity(base_model_gb, device_gb,
                                num_moe_layers=num_moe_layers)
 
@@ -2754,7 +3086,7 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
                         predictive=True)
     mx.eval(model.parameters())
 
-    # Memory guard: verify projected expert memory fits
+    # Memory guard
     active_gb = mx.metal.get_active_memory() / 1e9
     expert_slot_mb = 1.69
     projected_gb = active_gb + capacity * num_moe_layers * expert_slot_mb / 1024
@@ -2764,50 +3096,96 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
         capacity = (max_cap // 8) * 8
         capacity = max(capacity, 0)
         print(f"  [memory guard: reducing capacity to {capacity}]")
-        # Reinstall with reduced capacity
         enable_lazy_experts(model, model_path,
                             cache_capacity_per_layer=capacity,
                             predictive=True)
         mx.eval(model.parameters())
 
+    t_load = time.perf_counter() - t0
+    print(f"  Model load: {t_load:.1f}s ({mx.get_active_memory() / 1e9:.1f} GB)")
+
     # Resolve cache file path
     cache_path = None
+    prepacked_path = None
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
         safe_name = model_name.replace("/", "--")
         cache_path = os.path.join(cache_dir, f"{safe_name}.json")
+        prepacked_path = cache_path.replace(".json", ".weights.safetensors")
 
-    # Try to load from saved state
+    # --- Warm start paths ---
     used_saved_state = False
-    if cache_path and os.path.exists(cache_path):
-        cache_state = load_cache_state(cache_path)
-        upgraded = upgrade_from_saved_state(model, model_path, cache_state,
-                                            capacity)
 
-        # Delta warmup if prompt differs from saved
+    if prepacked and prepacked_path and os.path.exists(prepacked_path):
+        # Fastest warm start: load pre-stacked tensors directly
+        t0 = time.perf_counter()
+        with _with_cache_limit_zero():
+            load_prepacked_weights(model, prepacked_path, model_path=model_path)
+        t_upgrade = time.perf_counter() - t0
+        print(f"  Prepacked load: {t_upgrade:.1f}s")
+
+        # Delta warmup if prompt differs
+        if cache_path and os.path.exists(cache_path):
+            cache_state = load_cache_state(cache_path)
+            saved_prompt = cache_state.get("metadata", {}).get("prompt")
+            if saved_prompt and saved_prompt != prompt:
+                t0 = time.perf_counter()
+                with _with_cache_limit_zero():
+                    fast_delta_warmup(model, tokenizer, model_path, prompt,
+                                      discovery_tokens=10)
+                print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
+        used_saved_state = True
+
+    elif cache_path and os.path.exists(cache_path):
+        # Standard warm start: reload from safetensors shards
+        t0 = time.perf_counter()
+        cache_state = load_cache_state(cache_path)
+        with _with_cache_limit_zero():
+            upgrade_from_saved_state(model, model_path, cache_state, capacity)
+        t_upgrade = time.perf_counter() - t0
+        print(f"  Cache state upgrade: {t_upgrade:.1f}s")
+
         saved_prompt = cache_state.get("metadata", {}).get("prompt")
         if saved_prompt and saved_prompt != prompt:
+            t0 = time.perf_counter()
             with _with_cache_limit_zero():
                 fast_delta_warmup(model, tokenizer, model_path, prompt,
                                   discovery_tokens=10)
+            print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
         used_saved_state = True
-    else:
-        # Cold path: warmup generation + upgrade
-        with _with_cache_limit_zero():
-            _mlx_lm.generate(model, tokenizer, prompt=prompt,
-                             max_tokens=10, verbose=False)
 
+    else:
+        # --- Cold start paths ---
         if profile_path is not None:
+            # Profile-based: skip discovery entirely
+            t0 = time.perf_counter()
             profile = load_universal_profile(profile_path)
-            upgrade_to_predictive_with_pinning(model, model_path, capacity,
-                                               profile)
+            with _with_cache_limit_zero():
+                upgrade_from_profile(model, model_path, capacity, profile)
+            t_upgrade = time.perf_counter() - t0
+            print(f"  Profile-based upgrade: {t_upgrade:.1f}s")
         else:
-            upgrade_to_predictive(model, model_path, capacity)
+            # Router-only discovery (~1-2s vs ~75s full model)
+            t0 = time.perf_counter()
+            with _with_cache_limit_zero():
+                router_only_discovery(model, tokenizer, prompt, max_tokens=10)
+                upgrade_to_predictive(model, model_path, capacity)
+            t_upgrade = time.perf_counter() - t0
+            print(f"  Router-only discovery + upgrade: {t_upgrade:.1f}s")
 
     # Save state for next run
     if cache_path and not used_saved_state:
         save_cache_state(model, cache_path,
                          metadata={"prompt": prompt, "capacity": capacity})
+
+    # Save prepacked weights for fastest warm start next time
+    if prepacked and prepacked_path and not os.path.exists(prepacked_path):
+        t0 = time.perf_counter()
+        save_prepacked_weights(model, prepacked_path)
+        print(f"  Save prepacked: {time.perf_counter() - t0:.1f}s")
+
+    t_total = time.perf_counter() - t_total_start
+    print(f"  Total startup: {t_total:.1f}s")
 
     return _mlx_lm.generate(model, tokenizer, prompt=prompt,
                              max_tokens=max_tokens, verbose=False)
