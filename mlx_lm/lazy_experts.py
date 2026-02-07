@@ -1351,8 +1351,8 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
     t_discovery = time.perf_counter() - t0
 
     # Memory pressure check: reduce swap throughput if close to device limit
-    device_mem = mx.metal.device_info()["memory_size"]
-    active_mem = mx.metal.get_active_memory()
+    device_mem = mx.device_info()["memory_size"]
+    active_mem = mx.get_active_memory()
     memory_pressure = active_mem > 0.85 * device_mem
     MAX_SWAPS_PER_LAYER = 3 if memory_pressure else 10
     if memory_pressure:
@@ -1665,8 +1665,8 @@ class IncrementalDeltaWarmup:
         # Memory pressure check: limit swaps per layer if near device limit.
         # Each swap loads a shard (~336 MB transient), so under pressure we
         # process fewer swaps per step() to avoid pushing past the cliff.
-        device_mem = mx.metal.device_info()["memory_size"]
-        active_mem = mx.metal.get_active_memory()
+        device_mem = mx.device_info()["memory_size"]
+        active_mem = mx.get_active_memory()
         self._memory_pressure = active_mem > 0.85 * device_mem
         if self._memory_pressure:
             print(f"  [memory pressure: {active_mem / 1e9:.1f}/{device_mem / 1e9:.0f} GB — "
@@ -2347,24 +2347,26 @@ def select_capacity(target_model_memory_gb: float, system_memory_gb: float,
 # Metal cache limit helper
 # ---------------------------------------------------------------------------
 
-def _with_cache_limit_zero():
-    """Context manager to temporarily set Metal cache limit to 0.
+def _with_cache_limit_zero(cache_bytes=0):
+    """Context manager to temporarily reduce Metal cache limit.
 
-    Reclaims several GB of MLX buffer cache headroom, giving 1.3-2x speedup
-    for operations above the 20 GB Metal pressure cliff.
+    Reclaims MLX buffer cache headroom, giving 1.3-2x speedup for operations
+    above the 20 GB Metal pressure cliff. A small non-zero value (e.g. 256 MB)
+    allows intermediate buffer reuse during forward passes while still
+    reclaiming most cache memory.
     """
     import contextlib
 
     @contextlib.contextmanager
     def _ctx():
-        # MLX has no get_cache_limit(); restore to 25% of device memory (MLX default)
-        default_limit = mx.metal.device_info()["memory_size"] // 4
-        mx.metal.set_cache_limit(0)
-        mx.metal.clear_cache()
+        default_limit = mx.device_info()["memory_size"] // 4
+        mx.set_cache_limit(cache_bytes)
+        if cache_bytes == 0:
+            mx.clear_cache()
         try:
             yield
         finally:
-            mx.metal.set_cache_limit(default_limit)
+            mx.set_cache_limit(default_limit)
 
     return _ctx()
 
@@ -2608,9 +2610,9 @@ def upgrade_from_saved_state(model, model_path, cache_state, capacity, sync=Fals
         if _find_switch_mlp(layer)[0] is not None
     )
     expert_slot_mb = 1.69
-    base_memory_gb = mx.metal.get_active_memory() / 1e9
+    base_memory_gb = mx.get_active_memory() / 1e9
     projected_gb = base_memory_gb + capacity * num_moe_layers * expert_slot_mb / 1024
-    device_gb = mx.metal.device_info()["memory_size"] / 1e9
+    device_gb = mx.device_info()["memory_size"] / 1e9
     limit_gb = 0.85 * device_gb
 
     if projected_gb > limit_gb:
@@ -3076,7 +3078,7 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
             num_moe_layers += 1
             num_experts = _detect_num_experts(switch)
 
-    device_gb = mx.metal.device_info()["memory_size"] / 1e9
+    device_gb = mx.device_info()["memory_size"] / 1e9
     base_model_gb = 1.4
     capacity = select_capacity(base_model_gb, device_gb,
                                num_moe_layers=num_moe_layers)
@@ -3087,7 +3089,7 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
     mx.eval(model.parameters())
 
     # Memory guard
-    active_gb = mx.metal.get_active_memory() / 1e9
+    active_gb = mx.get_active_memory() / 1e9
     expert_slot_mb = 1.69
     projected_gb = active_gb + capacity * num_moe_layers * expert_slot_mb / 1024
     limit_gb = 0.85 * device_gb
@@ -3113,13 +3115,17 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
         cache_path = os.path.join(cache_dir, f"{safe_name}.json")
         prepacked_path = cache_path.replace(".json", ".weights.safetensors")
 
+    # 256 MB cache floor during warmup: retains small buffer cache for
+    # intermediate reuse, improving generation throughput by ~14% vs cache=0.
+    _WARMUP_CACHE = 256 * 1024 * 1024
+
     # --- Warm start paths ---
     used_saved_state = False
 
     if prepacked and prepacked_path and os.path.exists(prepacked_path):
         # Fastest warm start: load pre-stacked tensors directly
         t0 = time.perf_counter()
-        with _with_cache_limit_zero():
+        with _with_cache_limit_zero(_WARMUP_CACHE):
             load_prepacked_weights(model, prepacked_path, model_path=model_path)
         t_upgrade = time.perf_counter() - t0
         print(f"  Prepacked load: {t_upgrade:.1f}s")
@@ -3130,7 +3136,7 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
             saved_prompt = cache_state.get("metadata", {}).get("prompt")
             if saved_prompt and saved_prompt != prompt:
                 t0 = time.perf_counter()
-                with _with_cache_limit_zero():
+                with _with_cache_limit_zero(_WARMUP_CACHE):
                     fast_delta_warmup(model, tokenizer, model_path, prompt,
                                       discovery_tokens=10)
                 print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
@@ -3140,7 +3146,7 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
         # Standard warm start: reload from safetensors shards
         t0 = time.perf_counter()
         cache_state = load_cache_state(cache_path)
-        with _with_cache_limit_zero():
+        with _with_cache_limit_zero(_WARMUP_CACHE):
             upgrade_from_saved_state(model, model_path, cache_state, capacity)
         t_upgrade = time.perf_counter() - t0
         print(f"  Cache state upgrade: {t_upgrade:.1f}s")
@@ -3148,7 +3154,7 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
         saved_prompt = cache_state.get("metadata", {}).get("prompt")
         if saved_prompt and saved_prompt != prompt:
             t0 = time.perf_counter()
-            with _with_cache_limit_zero():
+            with _with_cache_limit_zero(_WARMUP_CACHE):
                 fast_delta_warmup(model, tokenizer, model_path, prompt,
                                   discovery_tokens=10)
             print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
@@ -3160,14 +3166,14 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
             # Profile-based: skip discovery entirely
             t0 = time.perf_counter()
             profile = load_universal_profile(profile_path)
-            with _with_cache_limit_zero():
+            with _with_cache_limit_zero(_WARMUP_CACHE):
                 upgrade_from_profile(model, model_path, capacity, profile)
             t_upgrade = time.perf_counter() - t0
             print(f"  Profile-based upgrade: {t_upgrade:.1f}s")
         else:
             # Router-only discovery (~1-2s vs ~75s full model)
             t0 = time.perf_counter()
-            with _with_cache_limit_zero():
+            with _with_cache_limit_zero(_WARMUP_CACHE):
                 router_only_discovery(model, tokenizer, prompt, max_tokens=10)
                 upgrade_to_predictive(model, model_path, capacity)
             t_upgrade = time.perf_counter() - t0
@@ -3186,6 +3192,13 @@ def flash_generate(model_name, prompt, max_tokens=200, cache_dir=None,
 
     t_total = time.perf_counter() - t_total_start
     print(f"  Total startup: {t_total:.1f}s")
+
+    if hasattr(mx, "set_wired_limit"):
+        active = mx.get_active_memory()
+        limit = int(mx.device_info()["memory_size"] * 0.75)
+        wired = min(active, limit)
+        mx.set_wired_limit(wired)
+        print(f"  Wired {wired / 1e9:.1f} GB in residency set")
 
     return _mlx_lm.generate(model, tokenizer, prompt=prompt,
                              max_tokens=max_tokens, verbose=False)
