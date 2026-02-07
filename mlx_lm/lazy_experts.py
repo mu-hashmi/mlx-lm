@@ -1965,3 +1965,13 @@ def speculative_router_cross_layer(model, tokenizer, prompt, max_tokens=10):
         collected[layer_idx] = all_experts
 
     return collected
+
+
+def select_capacity(target_model_memory_gb: float, system_memory_gb: float,
+                    num_moe_layers: int = 48, expert_slot_mb: float = 1.69) -> int:
+    """Select expert cache capacity to stay under the Metal memory pressure cliff."""
+    budget_gb = system_memory_gb * 0.56 - target_model_memory_gb
+    expert_memory_per_slot_gb = num_moe_layers * expert_slot_mb / 1024
+    capacity = int(budget_gb / expert_memory_per_slot_gb)
+    capacity = (capacity // 8) * 8
+    return max(0, min(512, capacity))
