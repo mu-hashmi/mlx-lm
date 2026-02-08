@@ -58,4 +58,4 @@ from .persistence import (
     upgrade_from_profile,
 )
 
-from .generate import flash_generate
+from .generate import flash_generate, flash_stream_generate, FlashSession

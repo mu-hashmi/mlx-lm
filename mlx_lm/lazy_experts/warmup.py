@@ -352,6 +352,7 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
         })
 
     # Step 3: Group shard loads, then fused load+scatter per layer within each shard
+    # Reduce cache limit during shard loads to prevent GPU timeout under memory pressure.
     shard_layers: dict[str, set[int]] = {}
     for i, swaps in layer_swaps.items():
         cache = layer_caches[i]
@@ -361,6 +362,9 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
 
     t_shard_load = 0.0
     t_scatter = 0.0
+
+    _default_cache = mx.device_info()["memory_size"] // 4
+    mx.set_cache_limit(256 * 1024 * 1024)
 
     for shard_path, layer_set in shard_layers.items():
         t_load_start = time.perf_counter()
@@ -467,6 +471,8 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
 
     if batch_eval:
         mx.eval(*batch_eval)
+
+    mx.set_cache_limit(_default_cache)
 
     t_lookup_rebuild = time.perf_counter() - t_lookup_start
     t_rebuild = time.perf_counter() - t1
